@@ -1,0 +1,11 @@
+torch
+torchvision
+opencv-python
+pandas
+matplotlib
+requests
+tqdm
+fastapi
+uvicorn
+python-multipart
+pycocotools

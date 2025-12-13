@@ -133,18 +133,37 @@ def build_optimizer(model, lr, weight_decay, momentum):
     return torch.optim.SGD(params, lr=lr, momentum=momentum, weight_decay=weight_decay, nesterov=True)
 
 
-def build_scheduler(optimizer, num_epochs: int, steps_per_epoch: int, warmup_epochs: int = 1):
-    total_steps = max(1, num_epochs * steps_per_epoch)
-    warmup_steps = max(1, warmup_epochs * steps_per_epoch)
+def build_scheduler(optimizer, num_epochs: int, warmup_epochs: int = 1):
+    """
+    Epoch-level warmup + cosine annealing.
+    - No PyTorch warnings
+    - Very stable for detection models
+    - Works well for small/medium datasets
+    """
 
-    def lr_lambda(step):
-        if step < warmup_steps:
-            return float(step) / float(warmup_steps)
-        progress = (step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-        # keep a floor so LR doesn't die completely
-        return 0.1 + 0.9 * 0.5 * (1.0 + np.cos(np.pi * progress))
+    # Warmup scheduler
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+        optimizer,
+        start_factor=0.1,
+        total_iters=warmup_epochs,
+    )
 
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    # Cosine scheduler (after warmup)
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=max(1, num_epochs - warmup_epochs),
+        eta_min=1e-5,
+    )
+
+    # Chain them
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[warmup_epochs],
+    )
+
+    return scheduler
+
 
 
 # -----------------------------
@@ -207,7 +226,6 @@ def train_one_epoch(
 
     return running / max(1, n)
 
-
 @torch.no_grad()
 def evaluate_coco(model, data_loader, device, score_thresh: float = 0.02, max_dets: int = 200):
     model.eval()
@@ -222,11 +240,22 @@ def evaluate_coco(model, data_loader, device, score_thresh: float = 0.02, max_de
     pbar = tqdm(data_loader, desc="Evaluating", dynamic_ncols=True)
 
     for images, targets in pbar:
+        # current (resized) size
         images = [img.to(device, non_blocking=True) for img in images]
         outputs = model(images)
 
         for i, out in enumerate(outputs):
             image_id = int(targets[i]["image_id"].item())
+
+            # ORIGINAL size from COCO (what COCOeval expects)
+            img_info = coco.loadImgs(image_id)[0]
+            orig_w, orig_h = float(img_info["width"]), float(img_info["height"])
+
+            _, resized_h, resized_w = images[i].shape  
+
+            sx = orig_w / float(resized_w)
+            sy = orig_h / float(resized_h)
+
             boxes = out["boxes"].detach().cpu().numpy()
             scores = out["scores"].detach().cpu().numpy()
             labels = out["labels"].detach().cpu().numpy()
@@ -238,18 +267,23 @@ def evaluate_coco(model, data_loader, device, score_thresh: float = 0.02, max_de
                 order = np.argsort(-scores)[:max_dets]
                 boxes, scores, labels = boxes[order], scores[order], labels[order]
 
+            boxes[:, [0, 2]] *= sx
+            boxes[:, [1, 3]] *= sy
+
             for box, score, label in zip(boxes, scores, labels):
                 cat_id = int(label_to_cat[int(label)]) if label_to_cat is not None else int(label)
+
                 x1, y1, x2, y2 = box
                 w = max(0.0, float(x2 - x1))
                 h = max(0.0, float(y2 - y1))
+
                 results.append(
-                    dict(
-                        image_id=image_id,
-                        category_id=cat_id,
-                        bbox=[float(x1), float(y1), w, h],
-                        score=float(score),
-                    )
+                    {
+                        "image_id": image_id,
+                        "category_id": cat_id,
+                        "bbox": [float(x1), float(y1), w, h],
+                        "score": float(score),
+                    }
                 )
 
     if not results:
@@ -262,6 +296,7 @@ def evaluate_coco(model, data_loader, device, score_thresh: float = 0.02, max_de
     coco_eval.accumulate()
     coco_eval.summarize()
     return float(coco_eval.stats[0])
+
 
 
 def save_checkpoint(model, optimizer, path: Path, epoch: int, best_map: float):
@@ -366,7 +401,11 @@ def main(args):
 
     # ------------------ Optim/Sched ------------------
     optimizer = build_optimizer(model, lr=args.lr, weight_decay=args.weight_decay, momentum=args.momentum)
-    scheduler = build_scheduler(optimizer, num_epochs=args.epochs, steps_per_epoch=len(train_loader), warmup_epochs=args.warmup_epochs)
+    scheduler = build_scheduler(
+        optimizer,
+        num_epochs=args.epochs,
+        warmup_epochs=args.warmup_epochs,
+    )
 
     use_amp = (device.type == "cuda") and args.amp
 

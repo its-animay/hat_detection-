@@ -4,7 +4,7 @@ import sys
 import time
 import random
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Optional, List, Dict, Tuple
 
 import numpy as np
 import torch
@@ -36,7 +36,6 @@ def set_seed(seed: int = 42):
 
 
 def get_base_dataset(ds):
-    # handles torch.utils.data.Subset and raw dataset
     return ds.dataset if hasattr(ds, "dataset") else ds
 
 
@@ -47,7 +46,6 @@ def to_device(images, targets, device):
 
 
 def make_loader(dataset, batch_size, shuffle, num_workers):
-    # pin_memory helps on CUDA, harmless otherwise
     pin = torch.cuda.is_available()
     return DataLoader(
         dataset,
@@ -62,7 +60,73 @@ def make_loader(dataset, batch_size, shuffle, num_workers):
 
 
 # -----------------------------
-# LR Scheduling
+# Better subset selection
+# -----------------------------
+def choose_best_subset(base_ds: HelmetDataset, fraction: float, seed: int = 42) -> List[int]:
+    """
+    Picks a "better" subset than random:
+    - prioritizes images that actually have boxes
+    - roughly balances classes by oversampling rare-class images into the selection pool
+    """
+    assert 0.0 < fraction <= 1.0
+    rng = np.random.default_rng(seed)
+
+    # Precompute counts per image (fast using COCO annotations)
+    img_ids = base_ds.ids
+    per_img = []
+    class_freq = {}
+
+    for idx, img_id in enumerate(img_ids):
+        ann_ids = base_ds.coco.getAnnIds(imgIds=img_id)
+        anns = base_ds.coco.loadAnns(ann_ids)
+
+        labels = []
+        for a in anns:
+            cat = a["category_id"]
+            # mapped label (1..K)
+            lbl = base_ds.cat_id_to_label[cat]
+            labels.append(lbl)
+
+        # image "value": more boxes -> more signal
+        num_boxes = len(labels)
+
+        # update class freq
+        for lbl in labels:
+            class_freq[lbl] = class_freq.get(lbl, 0) + 1
+
+        per_img.append((idx, num_boxes, labels))
+
+    # Compute weights: rare classes get higher weight
+    if class_freq:
+        maxf = max(class_freq.values())
+        class_weight = {c: (maxf / f) for c, f in class_freq.items()}
+    else:
+        class_weight = {}
+
+    # Score each image
+    scores = []
+    for idx, num_boxes, labels in per_img:
+        if num_boxes == 0:
+            score = 0.05  # keep a few negatives but not too many
+        else:
+            # base score from number of boxes + rare-class boost
+            rare_boost = sum(class_weight.get(l, 1.0) for l in set(labels))
+            score = (1.0 + np.log1p(num_boxes)) * rare_boost
+        scores.append(score)
+
+    scores = np.array(scores, dtype=np.float32)
+    scores = scores / (scores.sum() + 1e-12)
+
+    k = int(round(len(img_ids) * fraction))
+    k = max(1, k)
+
+    chosen = rng.choice(len(img_ids), size=k, replace=False, p=scores)
+    chosen = sorted(chosen.tolist())
+    return chosen
+
+
+# -----------------------------
+# Optim / Scheduler (stable for detection fine-tuning)
 # -----------------------------
 def build_optimizer(model, lr, weight_decay, momentum):
     params = [p for p in model.parameters() if p.requires_grad]
@@ -70,19 +134,15 @@ def build_optimizer(model, lr, weight_decay, momentum):
 
 
 def build_scheduler(optimizer, num_epochs: int, steps_per_epoch: int, warmup_epochs: int = 1):
-    """
-    Warmup for a few epochs then cosine decay.
-    This is a strong default for fine-tuning detection models.
-    """
     total_steps = max(1, num_epochs * steps_per_epoch)
     warmup_steps = max(1, warmup_epochs * steps_per_epoch)
 
     def lr_lambda(step):
         if step < warmup_steps:
             return float(step) / float(warmup_steps)
-        # cosine from 1 -> 0.05 (keeps LR from collapsing to 0)
         progress = (step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-        return 0.05 + 0.95 * 0.5 * (1.0 + np.cos(np.pi * progress))
+        # keep a floor so LR doesn't die completely
+        return 0.1 + 0.9 * 0.5 * (1.0 + np.cos(np.pi * progress))
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
@@ -90,6 +150,11 @@ def build_scheduler(optimizer, num_epochs: int, steps_per_epoch: int, warmup_epo
 # -----------------------------
 # Train / Eval
 # -----------------------------
+def freeze_backbone(model, freeze: bool = True):
+    for p in model.backbone.parameters():
+        p.requires_grad = not freeze
+
+
 def train_one_epoch(
     model,
     optimizer,
@@ -97,44 +162,40 @@ def train_one_epoch(
     data_loader,
     device,
     epoch: int,
-    scaler: Optional[torch.cuda.amp.GradScaler],
+    use_amp: bool,
     grad_clip_norm: float = 0.0,
-    log_every: int = 20,
+    log_every: int = 50,
 ):
     model.train()
     running = 0.0
     n = 0
 
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+
     pbar = tqdm(data_loader, desc=f"Epoch {epoch+1} Training", dynamic_ncols=True)
     for step, (images, targets) in enumerate(pbar):
         images, targets = to_device(images, targets, device)
-
         optimizer.zero_grad(set_to_none=True)
 
-        if scaler is not None:
-            with torch.cuda.amp.autocast():
+        if use_amp:
+            with torch.amp.autocast("cuda", enabled=True):
                 loss_dict = model(images, targets)
                 loss = sum(loss for loss in loss_dict.values())
-
             scaler.scale(loss).backward()
-
             if grad_clip_norm and grad_clip_norm > 0:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
-
             scaler.step(optimizer)
             scaler.update()
         else:
             loss_dict = model(images, targets)
             loss = sum(loss for loss in loss_dict.values())
             loss.backward()
-
             if grad_clip_norm and grad_clip_norm > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
-
             optimizer.step()
 
-        # scheduler is step-based (per iteration)
+        # ✅ Scheduler step AFTER optimizer.step (fixes your warning)
         if scheduler is not None:
             scheduler.step()
 
@@ -148,16 +209,13 @@ def train_one_epoch(
 
 
 @torch.no_grad()
-def evaluate_coco(model, data_loader, device, score_thresh: float = 0.05, max_dets: int = 100):
+def evaluate_coco(model, data_loader, device, score_thresh: float = 0.02, max_dets: int = 200):
     model.eval()
-
-    ds = data_loader.dataset
-    base = get_base_dataset(ds)
+    base = get_base_dataset(data_loader.dataset)
 
     coco = getattr(base, "coco", None)
     if coco is None:
         raise ValueError("COCO annotations not found in dataset; cannot evaluate.")
-
     label_to_cat = getattr(base, "label_to_cat_id", None)
 
     results = []
@@ -167,36 +225,31 @@ def evaluate_coco(model, data_loader, device, score_thresh: float = 0.05, max_de
         images = [img.to(device, non_blocking=True) for img in images]
         outputs = model(images)
 
-        for i, output in enumerate(outputs):
+        for i, out in enumerate(outputs):
             image_id = int(targets[i]["image_id"].item())
+            boxes = out["boxes"].detach().cpu().numpy()
+            scores = out["scores"].detach().cpu().numpy()
+            labels = out["labels"].detach().cpu().numpy()
 
-            boxes = output["boxes"].detach().cpu().numpy()
-            scores = output["scores"].detach().cpu().numpy()
-            labels = output["labels"].detach().cpu().numpy()
-
-            # Filter low-confidence detections (stabilizes COCOeval early)
             keep = scores >= score_thresh
             boxes, scores, labels = boxes[keep], scores[keep], labels[keep]
 
-            # Optional: cap detections
             if len(scores) > max_dets:
                 order = np.argsort(-scores)[:max_dets]
                 boxes, scores, labels = boxes[order], scores[order], labels[order]
 
             for box, score, label in zip(boxes, scores, labels):
                 cat_id = int(label_to_cat[int(label)]) if label_to_cat is not None else int(label)
-
                 x1, y1, x2, y2 = box
                 w = max(0.0, float(x2 - x1))
                 h = max(0.0, float(y2 - y1))
-
                 results.append(
-                    {
-                        "image_id": image_id,
-                        "category_id": cat_id,
-                        "bbox": [float(x1), float(y1), w, h],
-                        "score": float(score),
-                    }
+                    dict(
+                        image_id=image_id,
+                        category_id=cat_id,
+                        bbox=[float(x1), float(y1), w, h],
+                        score=float(score),
+                    )
                 )
 
     if not results:
@@ -208,17 +261,7 @@ def evaluate_coco(model, data_loader, device, score_thresh: float = 0.05, max_de
     coco_eval.evaluate()
     coco_eval.accumulate()
     coco_eval.summarize()
-
-    return float(coco_eval.stats[0])  # AP@[0.5:0.95]
-
-
-def freeze_backbone(model, freeze: bool = True):
-    """
-    Freezing backbone for first 1-2 epochs can help stabilize fine-tuning and improve accuracy.
-    (Especially on small datasets.)
-    """
-    for name, param in model.backbone.named_parameters():
-        param.requires_grad = not freeze
+    return float(coco_eval.stats[0])
 
 
 def save_checkpoint(model, optimizer, path: Path, epoch: int, best_map: float):
@@ -232,6 +275,23 @@ def save_checkpoint(model, optimizer, path: Path, epoch: int, best_map: float):
         },
         str(path),
     )
+
+
+def sanity_print_dataset(ds, name="DATASET"):
+    base = get_base_dataset(ds)
+    cats = base.coco.cats
+    print(f"\n[{name}] images={len(base.ids)} anns={len(base.coco.anns)}")
+    print(f"[{name}] categories:")
+    for k, v in cats.items():
+        print(" ", k, "->", v.get("name"))
+
+    # quick label sanity from 3 samples
+    for i in [0, min(1, len(base)-1), min(2, len(base)-1)]:
+        img, tgt = base[i]
+        if tgt["labels"].numel():
+            print(f"[{name}] sample {i} labels unique:", torch.unique(tgt["labels"]).tolist())
+        else:
+            print(f"[{name}] sample {i} has NO boxes")
 
 
 # -----------------------------
@@ -248,76 +308,74 @@ def main(args):
         device = torch.device(args.device)
 
     print(f"Using device: {device}")
-
-    # Use more CPU threads for dataloading/transforms
     torch.set_num_threads(max(1, os.cpu_count() or 1))
 
     # ------------------ Data ------------------
     print("Loading data...")
     train_dir = project_root / "data" / "train"
-    train_ds = HelmetDataset(
+    train_base = HelmetDataset(
         str(train_dir),
         str(train_dir / "_annotations.coco.json"),
         get_transform(train=True, resize_min=args.resize, resize_max=args.resize_max),
     )
-    if args.max_train_images is not None:
-        idx = list(range(min(args.max_train_images, len(train_ds))))
-        train_ds = torch.utils.data.Subset(train_ds, idx)
 
     test_ann_path = project_root / "data" / "test" / "_annotations.coco.json"
     if test_ann_path.exists():
-        test_ds = HelmetDataset(
+        test_base = HelmetDataset(
             str(test_ann_path.parent),
             str(test_ann_path),
             get_transform(train=False, resize_min=args.resize, resize_max=args.resize_max),
         )
-        if args.max_val_images is not None:
-            idx = list(range(min(args.max_val_images, len(test_ds))))
-            test_ds = torch.utils.data.Subset(test_ds, idx)
     else:
-        print("Test dataset not found, using subset of train for validation (not recommended for final eval).")
-        perm = torch.randperm(len(train_ds)).tolist()
-        subset_size = args.max_val_images if args.max_val_images is not None else 50
-        test_ds = torch.utils.data.Subset(train_ds, perm[:subset_size])
+        raise FileNotFoundError("data/test/_annotations.coco.json not found. Please provide a real test/val split.")
+
+    # Optional: best subset of training data
+    if args.train_fraction < 1.0:
+        chosen = choose_best_subset(train_base, fraction=args.train_fraction, seed=args.seed)
+        train_ds = torch.utils.data.Subset(train_base, chosen)
+        print(f"Using BEST subset: train_fraction={args.train_fraction} -> {len(chosen)} images")
+    else:
+        train_ds = train_base
+
+    # Optional caps
+    if args.max_train_images is not None:
+        train_ds = torch.utils.data.Subset(train_ds, list(range(min(args.max_train_images, len(train_ds)))))
+    if args.max_val_images is not None:
+        test_ds = torch.utils.data.Subset(test_base, list(range(min(args.max_val_images, len(test_base)))))
+    else:
+        test_ds = test_base
+
+    sanity_print_dataset(train_ds, "TRAIN")
+    sanity_print_dataset(test_ds, "VAL")
 
     train_loader = make_loader(train_ds, args.batch_size, shuffle=True, num_workers=args.num_workers)
     test_loader = make_loader(test_ds, args.batch_size, shuffle=False, num_workers=args.num_workers)
 
     base_train = get_base_dataset(train_ds)
     num_classes = len(base_train.coco.cats) + 1
-    print(f"Num classes: {num_classes}")
+    print(f"\nNum classes: {num_classes}")
 
     # ------------------ Model ------------------
     model = get_model(num_classes, backbone=args.model)
     model.to(device)
 
-    # Optional: freeze backbone for first epochs
+    # Backbone freezing: for custom datasets, often better to not freeze long
     if args.freeze_backbone_epochs > 0:
         freeze_backbone(model, True)
         print(f"Backbone frozen for first {args.freeze_backbone_epochs} epoch(s).")
 
     # ------------------ Optim/Sched ------------------
     optimizer = build_optimizer(model, lr=args.lr, weight_decay=args.weight_decay, momentum=args.momentum)
-    steps_per_epoch = len(train_loader)
+    scheduler = build_scheduler(optimizer, num_epochs=args.epochs, steps_per_epoch=len(train_loader), warmup_epochs=args.warmup_epochs)
 
-    scheduler = build_scheduler(
-        optimizer,
-        num_epochs=args.epochs,
-        steps_per_epoch=steps_per_epoch,
-        warmup_epochs=args.warmup_epochs,
-    )
-
-    # AMP only on CUDA
     use_amp = (device.type == "cuda") and args.amp
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
-
-    # ------------------ Train Loop ------------------
-    best_map = -1.0
-    patience_left = args.early_stop_patience
 
     out_dir = project_root / args.output_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    best_map = -1.0
+
+    # ------------------ Train Loop ------------------
     for epoch in range(args.epochs):
         if args.freeze_backbone_epochs > 0 and epoch == args.freeze_backbone_epochs:
             freeze_backbone(model, False)
@@ -331,18 +389,14 @@ def main(args):
             data_loader=train_loader,
             device=device,
             epoch=epoch,
-            scaler=scaler if use_amp else None,
+            use_amp=use_amp,
             grad_clip_norm=args.grad_clip_norm,
         )
-        dt = time.time() - t0
-        print(f"Average Training Loss: {avg_loss:.4f}  | epoch_time: {dt:.1f}s")
+        print(f"Average Training Loss: {avg_loss:.4f} | epoch_time: {time.time()-t0:.1f}s")
 
-        # Save last each epoch
         save_checkpoint(model, optimizer, out_dir / "ckpt_last.pt", epoch=epoch, best_map=best_map)
 
-        # Evaluate every N epochs
-        do_eval = ((epoch + 1) % args.eval_every == 0) or (epoch == args.epochs - 1)
-        if do_eval:
+        if ((epoch + 1) % args.eval_every == 0) or (epoch == args.epochs - 1):
             print("Running validation...")
             map_score = evaluate_coco(
                 model=model,
@@ -355,16 +409,8 @@ def main(args):
 
             if map_score > best_map:
                 best_map = map_score
-                patience_left = args.early_stop_patience
                 print(f"New best model! (mAP: {best_map:.4f})")
                 save_checkpoint(model, optimizer, out_dir / "ckpt_best.pt", epoch=epoch, best_map=best_map)
-            else:
-                if args.early_stop_patience > 0:
-                    patience_left -= 1
-                    print(f"No improvement. Early-stop patience left: {patience_left}")
-                    if patience_left <= 0:
-                        print("Early stopping triggered.")
-                        break
 
     print("Training completed.")
     print(f"Best mAP: {best_map:.4f}")
@@ -372,41 +418,42 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train Faster R-CNN Helmet Detector (Optimized)")
+    parser = argparse.ArgumentParser(description="Train Faster R-CNN Helmet Detector (Accuracy-Optimized)")
 
-    # Core
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--lr", type=float, default=0.005)
+    parser.add_argument("--epochs", type=int, default=35)
+    parser.add_argument("--batch_size", type=int, default=2)
+
+    # IMPORTANT: for small datasets, lower LR helps
+    parser.add_argument("--lr", type=float, default=0.002)
+    parser.add_argument("--momentum", type=float, default=0.9)
+    parser.add_argument("--weight_decay", type=float, default=5e-4)
+
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda", "mps"])
-    parser.add_argument("--model", type=str, default="mobilenet_320", choices=["resnet50", "mobilenet", "mobilenet_320"])
+    parser.add_argument("--model", type=str, default="resnet50", choices=["resnet50", "mobilenet", "mobilenet_320"])
     parser.add_argument("--output_dir", type=str, default="models")
 
-    # DataLoader
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--max_train_images", type=int, default=None)
     parser.add_argument("--max_val_images", type=int, default=None)
 
-    # Resize
-    parser.add_argument("--resize", type=int, default=320, help="Set to 320 for mobilenet_320; 640 for stronger accuracy but slower")
-    parser.add_argument("--resize_max", type=int, default=320)
+    # Resize: resnet50 usually works well at 640
+    parser.add_argument("--resize", type=int, default=640)
+    parser.add_argument("--resize_max", type=int, default=640)
 
-    # Optimization knobs
-    parser.add_argument("--momentum", type=float, default=0.9)
-    parser.add_argument("--weight_decay", type=float, default=5e-4)
     parser.add_argument("--warmup_epochs", type=int, default=1)
     parser.add_argument("--grad_clip_norm", type=float, default=1.0)
-    parser.add_argument("--amp", action="store_true", help="Use mixed precision (CUDA only)")
-    parser.add_argument("--freeze_backbone_epochs", type=int, default=1)
+    parser.add_argument("--amp", action="store_true")
 
-    # Eval knobs
+    parser.add_argument("--freeze_backbone_epochs", type=int, default=0)
+
     parser.add_argument("--eval_every", type=int, default=1)
-    parser.add_argument("--eval_score_thresh", type=float, default=0.05)
-    parser.add_argument("--eval_max_dets", type=int, default=100)
+    parser.add_argument("--eval_score_thresh", type=float, default=0.02)
+    parser.add_argument("--eval_max_dets", type=int, default=200)
 
-    # Repro/Early stop
+    # ✅ Train on best subset
+    parser.add_argument("--train_fraction", type=float, default=1.0, help="Use best subset of training data (e.g., 0.5)")
+
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--early_stop_patience", type=int, default=0, help="0 disables early stopping")
 
     args = parser.parse_args()
     main(args)

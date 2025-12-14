@@ -1,5 +1,4 @@
 import argparse
-import os
 import sys
 import time
 import random
@@ -11,6 +10,7 @@ import torch
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 from pycocotools.cocoeval import COCOeval
+from torchmetrics.detection.mean_ap import MeanAveragePrecision
 
 # Allow running as script or module
 if __package__ is None or __package__ == "":
@@ -32,7 +32,8 @@ def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def get_base_dataset(ds):
@@ -77,18 +78,25 @@ def print_label_distribution(ds, name="DATASET", max_items=300):
 # -----------------------------
 # Optimizer + Scheduler
 # -----------------------------
-def build_optimizer(model, lr, momentum, weight_decay):
+def build_optimizer(model, lr, momentum, weight_decay, kind: str):
     params = [p for p in model.parameters() if p.requires_grad]
+    if kind == "adamw":
+        return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
     return torch.optim.SGD(
         params, lr=lr, momentum=momentum, weight_decay=weight_decay, nesterov=True
     )
 
 
-def build_scheduler(optimizer, num_epochs: int, warmup_epochs: int = 1):
+def build_scheduler(optimizer, num_epochs: int, warmup_epochs: int, kind: str):
     """
-    Epoch-level warmup then cosine decay.
-    Call scheduler.step() ONCE per epoch (after training epoch).
+    - cosine: warmup then cosine decay (epoch-level)
+    - plateau: ReduceLROnPlateau on validation loss (step after validation)
     """
+    if kind == "plateau":
+        return torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=0.5, patience=2, min_lr=1e-7
+        )
+
     warmup_epochs = max(0, min(warmup_epochs, num_epochs))
     if warmup_epochs == 0:
         return torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -217,6 +225,46 @@ def evaluate_coco(model, data_loader, device, score_thresh=0.05, max_dets=100):
     return float(coco_eval.stats[0])
 
 
+@torch.no_grad()
+def evaluate_torchmetrics(model, data_loader, device, score_thresh=0.05, max_dets=100):
+    """COCO-free evaluation using torchmetrics MeanAveragePrecision."""
+    metric = MeanAveragePrecision(iou_type="bbox")
+    model.eval()
+
+    pbar = tqdm(data_loader, desc="Evaluating", dynamic_ncols=True)
+    for images, targets in pbar:
+        images = [img.to(device, non_blocking=True) for img in images]
+        outputs = model(images)
+
+        preds = []
+        gts = []
+
+        for i, out in enumerate(outputs):
+            boxes = out["boxes"].detach().cpu()
+            scores = out["scores"].detach().cpu()
+            labels = out["labels"].detach().cpu()
+
+            keep = scores >= score_thresh
+            boxes, scores, labels = boxes[keep], scores[keep], labels[keep]
+
+            if len(scores) > max_dets:
+                order = torch.argsort(scores, descending=True)[:max_dets]
+                boxes, scores, labels = boxes[order], scores[order], labels[order]
+
+            preds.append({"boxes": boxes, "scores": scores, "labels": labels})
+
+            gt = {
+                "boxes": targets[i]["boxes"].cpu(),
+                "labels": targets[i]["labels"].cpu(),
+            }
+            gts.append(gt)
+
+        metric.update(preds, gts)
+
+    res = metric.compute()
+    return float(res["map_50"].item()), res
+
+
 # -----------------------------
 # Main
 # -----------------------------
@@ -235,19 +283,24 @@ def main(args):
     # ------------------ Data ------------------
     print("Loading data...")
 
-    train_dir = project_root / "data" / "train"
+    # Resolve paths
+    train_dir = project_root / args.train_dir
+    train_ann = train_dir / args.train_ann
+    val_dir = project_root / args.val_dir
+    val_ann = val_dir / args.val_ann
+
+    for p in [train_dir, train_ann, val_dir, val_ann]:
+        if not p.exists():
+            raise FileNotFoundError(f"{p} not found. Run `python -m src.data_setup` to download/prepare the dataset.")
+
     train_full = HelmetDataset(
         str(train_dir),
-        str(train_dir / "_annotations.coco.json"),
+        str(train_ann),
         get_transform(train=True, resize_min=args.resize, resize_max=args.resize_max),
     )
 
-    val_ann = project_root / "data" / "test" / "_annotations.coco.json"
-    if not val_ann.exists():
-        raise FileNotFoundError("data/test/_annotations.coco.json not found.")
-
     val_full = HelmetDataset(
-        str(val_ann.parent),
+        str(val_dir),
         str(val_ann),
         get_transform(train=False, resize_min=args.resize, resize_max=args.resize_max),
     )
@@ -277,8 +330,8 @@ def main(args):
     model.to(device)
 
     # ------------------ Optim/Sched ------------------
-    optimizer = build_optimizer(model, args.lr, args.momentum, args.weight_decay)
-    scheduler = build_scheduler(optimizer, args.epochs, args.warmup_epochs)
+    optimizer = build_optimizer(model, args.lr, args.momentum, args.weight_decay, kind=args.optimizer)
+    scheduler = build_scheduler(optimizer, args.epochs, args.warmup_epochs, kind=args.scheduler)
     use_amp = (device.type == "cuda") and args.amp
 
     out_dir = project_root / args.output_dir
@@ -286,6 +339,7 @@ def main(args):
 
     # ------------------ Train Loop ------------------
     best_map = -1.0
+    stale_epochs = 0
 
     for epoch in range(args.epochs):
         t0 = time.time()
@@ -298,25 +352,55 @@ def main(args):
             use_amp=use_amp,
             grad_clip_norm=args.grad_clip_norm,
         )
-        scheduler.step()  # epoch-level scheduler step
+        if args.scheduler != "plateau":
+            scheduler.step()  # epoch-level scheduler step
 
         print(f"Epoch {epoch+1}/{args.epochs} | loss={loss:.4f} | time={time.time()-t0:.1f}s")
 
         if (epoch + 1) % args.eval_every == 0 or (epoch == args.epochs - 1):
             print("Running validation...")
-            mAP = evaluate_coco(
-                model=model,
-                data_loader=val_loader,
-                device=device,
-                score_thresh=args.eval_score_thresh,
-                max_dets=args.eval_max_dets,
-            )
-            print(f"Validation mAP: {mAP:.4f}")
+            if args.eval_type == "coco":
+                mAP = evaluate_coco(
+                    model=model,
+                    data_loader=val_loader,
+                    device=device,
+                    score_thresh=args.eval_score_thresh,
+                    max_dets=args.eval_max_dets,
+                )
+                metrics_to_print = {"mAP_coco": mAP}
+                val_score = mAP
+            else:
+                mAP50, full = evaluate_torchmetrics(
+                    model=model,
+                    data_loader=val_loader,
+                    device=device,
+                    score_thresh=args.eval_score_thresh,
+                    max_dets=args.eval_max_dets,
+                )
+                metrics_to_print = {
+                    "mAP@0.5": mAP50,
+                    "mAP@0.5:0.95": float(full["map"].item()),
+                    "precision": float(full["map_per_class"].mean().item()) if full["map_per_class"].numel() > 0 else None,
+                    "recall": float(full["mar"].item()),
+                }
+                val_score = mAP50
 
-            if mAP > best_map:
-                best_map = mAP
+            print(f"Validation metrics: {metrics_to_print}")
+
+            if args.scheduler == "plateau":
+                scheduler.step(1.0 - val_score)
+
+            if val_score > best_map + 1e-4:
+                best_map = val_score
+                stale_epochs = 0
                 torch.save(model.state_dict(), out_dir / "model_best.pth")
-                print(f"Saved best model (mAP={best_map:.4f})")
+                print(f"Saved best model (score={best_map:.4f})")
+            else:
+                stale_epochs += 1
+
+            if args.early_stop_patience is not None and stale_epochs >= args.early_stop_patience:
+                print(f"No improvement for {stale_epochs} evals. Early stopping.")
+                break
 
     print("Done.")
     print(f"Best mAP: {best_map:.4f}")
@@ -329,29 +413,39 @@ if __name__ == "__main__":
     p.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
     p.add_argument("--model", default="mobilenet_320", choices=["resnet50", "mobilenet", "mobilenet_320"])
 
-    p.add_argument("--epochs", type=int, default=5)
+    p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--batch_size", type=int, default=2)
     p.add_argument("--lr", type=float, default=0.002)
     p.add_argument("--momentum", type=float, default=0.9)
     p.add_argument("--weight_decay", type=float, default=5e-4)
+    p.add_argument("--optimizer", type=str, default="adamw", choices=["sgd", "adamw"])
+    p.add_argument("--scheduler", type=str, default="plateau", choices=["cosine", "plateau"])
 
     p.add_argument("--warmup_epochs", type=int, default=1)
     p.add_argument("--grad_clip_norm", type=float, default=1.0)
     p.add_argument("--amp", action="store_true")
 
-    p.add_argument("--resize", type=int, default=320)
-    p.add_argument("--resize_max", type=int, default=320)
+    p.add_argument("--resize", type=int, default=640)
+    p.add_argument("--resize_max", type=int, default=640)
 
     p.add_argument("--num_workers", type=int, default=2)
 
+    # Data paths
+    p.add_argument("--train_dir", type=str, default="data/train")
+    p.add_argument("--train_ann", type=str, default="_annotations.coco.json")
+    p.add_argument("--val_dir", type=str, default="data/test")
+    p.add_argument("--val_ann", type=str, default="_annotations.coco.json")
+
     #subset knobs
-    p.add_argument("--max_train_images", type=int, default=300)
-    p.add_argument("--max_val_images", type=int, default=150)
+    p.add_argument("--max_train_images", type=int, default=None, help="If set, randomly subsample this many train images")
+    p.add_argument("--max_val_images", type=int, default=None, help="If set, randomly subsample this many val images")
 
     # Eval knobs
     p.add_argument("--eval_every", type=int, default=1)
     p.add_argument("--eval_score_thresh", type=float, default=0.05)
     p.add_argument("--eval_max_dets", type=int, default=100)
+    p.add_argument("--eval_type", type=str, default="torchmetrics", choices=["torchmetrics", "coco"], help="Use COCO mAP or torchmetrics mAP (no pycocotools needed)")
+    p.add_argument("--early_stop_patience", type=int, default=5, help="Stop if no improvement after this many evals; set None to disable")
 
     p.add_argument("--output_dir", type=str, default="models")
     p.add_argument("--seed", type=int, default=42)

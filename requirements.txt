@@ -9,3 +9,5 @@ fastapi
 uvicorn
 python-multipart
 pycocotools
+kagglehub
+torchmetrics

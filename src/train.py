@@ -4,6 +4,7 @@ import sys
 import time
 import random
 from pathlib import Path
+from collections import Counter
 
 import numpy as np
 import torch
@@ -27,7 +28,7 @@ def collate_fn(batch):
     return tuple(zip(*batch))
 
 
-def set_seed(seed: int = 42):
+def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -52,19 +53,48 @@ def make_loader(dataset, batch_size, shuffle, num_workers):
     )
 
 
+def random_subset(dataset, n: int, seed: int):
+    """Return a random Subset of size n (or full dataset if n is None)."""
+    if n is None:
+        return dataset
+    n = min(n, len(dataset))
+    g = torch.Generator().manual_seed(seed)
+    idx = torch.randperm(len(dataset), generator=g)[:n].tolist()
+    return torch.utils.data.Subset(dataset, idx)
+
+
+def print_label_distribution(ds, name="DATASET", max_items=300):
+    """Quick sanity check: how many labels appear in the subset."""
+    base = get_base_dataset(ds)
+    cnt = Counter()
+    k = min(max_items, len(ds))
+    for i in range(k):
+        _, t = ds[i]
+        cnt.update(t["labels"].tolist())
+    print(f"\n[{name}] Label distribution (first {k} samples): {dict(cnt)}")
+
+
 # -----------------------------
 # Optimizer + Scheduler
 # -----------------------------
 def build_optimizer(model, lr, momentum, weight_decay):
     params = [p for p in model.parameters() if p.requires_grad]
-    return torch.optim.SGD(params, lr=lr, momentum=momentum, weight_decay=weight_decay, nesterov=True)
+    return torch.optim.SGD(
+        params, lr=lr, momentum=momentum, weight_decay=weight_decay, nesterov=True
+    )
 
 
 def build_scheduler(optimizer, num_epochs: int, warmup_epochs: int = 1):
     """
-    Epoch-level warmup + cosine.
-    Step ONLY once per epoch.
+    Epoch-level warmup then cosine decay.
+    Call scheduler.step() ONCE per epoch (after training epoch).
     """
+    warmup_epochs = max(0, min(warmup_epochs, num_epochs))
+    if warmup_epochs == 0:
+        return torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max(1, num_epochs), eta_min=1e-5
+        )
+
     warmup = torch.optim.lr_scheduler.LinearLR(
         optimizer, start_factor=0.1, total_iters=warmup_epochs
     )
@@ -79,7 +109,7 @@ def build_scheduler(optimizer, num_epochs: int, warmup_epochs: int = 1):
 # -----------------------------
 # Train / Eval
 # -----------------------------
-def train_one_epoch(model, optimizer, data_loader, device, epoch, use_amp, grad_clip_norm=1.0):
+def train_one_epoch(model, optimizer, data_loader, device, epoch, use_amp, grad_clip_norm):
     model.train()
     running = 0.0
     n = 0
@@ -96,7 +126,7 @@ def train_one_epoch(model, optimizer, data_loader, device, epoch, use_amp, grad_
         if use_amp:
             with torch.amp.autocast("cuda", enabled=True):
                 loss_dict = model(images, targets)
-                loss = sum(loss for loss in loss_dict.values())
+                loss = sum(v for v in loss_dict.values())
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -105,7 +135,7 @@ def train_one_epoch(model, optimizer, data_loader, device, epoch, use_amp, grad_
             scaler.update()
         else:
             loss_dict = model(images, targets)
-            loss = sum(loss for loss in loss_dict.values())
+            loss = sum(v for v in loss_dict.values())
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
             optimizer.step()
@@ -138,9 +168,9 @@ def evaluate_coco(model, data_loader, device, score_thresh=0.05, max_dets=100):
         for i, out in enumerate(outputs):
             image_id = int(targets[i]["image_id"].item())
 
-            # original size from COCO (COCOeval expects original coords)
-            img_info = coco.loadImgs(image_id)[0]
-            orig_w, orig_h = float(img_info["width"]), float(img_info["height"])
+            # Original image size (COCO expects original coords)
+            info = coco.loadImgs(image_id)[0]
+            orig_w, orig_h = float(info["width"]), float(info["height"])
 
             _, resized_h, resized_w = images[i].shape
             sx = orig_w / float(resized_w)
@@ -157,23 +187,23 @@ def evaluate_coco(model, data_loader, device, score_thresh=0.05, max_dets=100):
                 order = np.argsort(-scores)[:max_dets]
                 boxes, scores, labels = boxes[order], scores[order], labels[order]
 
-            # scale boxes back to original
+            # Scale boxes back to original image coords
             boxes[:, [0, 2]] *= sx
             boxes[:, [1, 3]] *= sy
 
             for box, score, label in zip(boxes, scores, labels):
                 cat_id = int(label_to_cat[int(label)]) if label_to_cat is not None else int(label)
-
                 x1, y1, x2, y2 = box
                 w = max(0.0, float(x2 - x1))
                 h = max(0.0, float(y2 - y1))
-
-                results.append({
-                    "image_id": image_id,
-                    "category_id": cat_id,
-                    "bbox": [float(x1), float(y1), w, h],
-                    "score": float(score),
-                })
+                results.append(
+                    {
+                        "image_id": image_id,
+                        "category_id": cat_id,
+                        "bbox": [float(x1), float(y1), w, h],
+                        "score": float(score),
+                    }
+                )
 
     if not results:
         print("No detections found.")
@@ -192,6 +222,7 @@ def evaluate_coco(model, data_loader, device, score_thresh=0.05, max_dets=100):
 # -----------------------------
 def main(args):
     set_seed(args.seed)
+
     project_root = Path(__file__).resolve().parent.parent
 
     if args.device == "auto":
@@ -201,11 +232,11 @@ def main(args):
 
     print(f"Using device: {device}")
 
-    # --- Datasets ---
+    # ------------------ Data ------------------
     print("Loading data...")
 
     train_dir = project_root / "data" / "train"
-    train_ds = HelmetDataset(
+    train_full = HelmetDataset(
         str(train_dir),
         str(train_dir / "_annotations.coco.json"),
         get_transform(train=True, resize_min=args.resize, resize_max=args.resize_max),
@@ -215,22 +246,24 @@ def main(args):
     if not val_ann.exists():
         raise FileNotFoundError("data/test/_annotations.coco.json not found.")
 
-    val_ds = HelmetDataset(
+    val_full = HelmetDataset(
         str(val_ann.parent),
         str(val_ann),
         get_transform(train=False, resize_min=args.resize, resize_max=args.resize_max),
     )
 
-    # --- Small subsets ---
-    if args.max_train_images is not None:
-        n = min(args.max_train_images, len(train_ds))
-        train_ds = torch.utils.data.Subset(train_ds, list(range(n)))
-        print(f"Training on subset: {n} images")
+    # Subset 
+    train_ds = random_subset(train_full, args.max_train_images, seed=args.seed)
+    val_ds = random_subset(val_full, args.max_val_images, seed=args.seed + 999)
 
+    if args.max_train_images is not None:
+        print(f"Training on subset: {len(train_ds)} images")
     if args.max_val_images is not None:
-        n = min(args.max_val_images, len(val_ds))
-        val_ds = torch.utils.data.Subset(val_ds, list(range(n)))
-        print(f"Validating on subset: {n} images")
+        print(f"Validating on subset: {len(val_ds)} images")
+
+    if args.print_dist:
+        print_label_distribution(train_ds, "TRAIN_SUBSET")
+        print_label_distribution(val_ds, "VAL_SUBSET")
 
     train_loader = make_loader(train_ds, args.batch_size, shuffle=True, num_workers=args.num_workers)
     val_loader = make_loader(val_ds, args.batch_size, shuffle=False, num_workers=args.num_workers)
@@ -239,37 +272,51 @@ def main(args):
     num_classes = len(base_train.coco.cats) + 1
     print(f"Num classes: {num_classes}")
 
-    # --- Model ---
+    # ------------------ Model ------------------
     model = get_model(num_classes, backbone=args.model)
     model.to(device)
 
-    # --- Optim + Scheduler ---
+    # ------------------ Optim/Sched ------------------
     optimizer = build_optimizer(model, args.lr, args.momentum, args.weight_decay)
     scheduler = build_scheduler(optimizer, args.epochs, args.warmup_epochs)
-
     use_amp = (device.type == "cuda") and args.amp
 
-    # --- Train ---
-    best_map = -1.0
     out_dir = project_root / args.output_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # ------------------ Train Loop ------------------
+    best_map = -1.0
+
     for epoch in range(args.epochs):
         t0 = time.time()
-        loss = train_one_epoch(model, optimizer, train_loader, device, epoch, use_amp, grad_clip_norm=args.grad_clip_norm)
-        scheduler.step()
+        loss = train_one_epoch(
+            model=model,
+            optimizer=optimizer,
+            data_loader=train_loader,
+            device=device,
+            epoch=epoch,
+            use_amp=use_amp,
+            grad_clip_norm=args.grad_clip_norm,
+        )
+        scheduler.step()  # epoch-level scheduler step
+
         print(f"Epoch {epoch+1}/{args.epochs} | loss={loss:.4f} | time={time.time()-t0:.1f}s")
 
-        # Eval every epoch 
-        print("Running validation...")
-        mAP = evaluate_coco(model, val_loader, device, score_thresh=args.eval_score_thresh, max_dets=args.eval_max_dets)
-        print(f"Validation mAP: {mAP:.4f}")
+        if (epoch + 1) % args.eval_every == 0 or (epoch == args.epochs - 1):
+            print("Running validation...")
+            mAP = evaluate_coco(
+                model=model,
+                data_loader=val_loader,
+                device=device,
+                score_thresh=args.eval_score_thresh,
+                max_dets=args.eval_max_dets,
+            )
+            print(f"Validation mAP: {mAP:.4f}")
 
-        # Save best
-        if mAP > best_map:
-            best_map = mAP
-            torch.save(model.state_dict(), out_dir / "model_best.pth")
-            print(f"Saved best model (mAP={best_map:.4f})")
+            if mAP > best_map:
+                best_map = mAP
+                torch.save(model.state_dict(), out_dir / "model_best.pth")
+                print(f"Saved best model (mAP={best_map:.4f})")
 
     print("Done.")
     print(f"Best mAP: {best_map:.4f}")
@@ -297,16 +344,18 @@ if __name__ == "__main__":
 
     p.add_argument("--num_workers", type=int, default=2)
 
-    # subset knobs
-    p.add_argument("--max_train_images", type=int, default=200)
-    p.add_argument("--max_val_images", type=int, default=100)
+    #subset knobs
+    p.add_argument("--max_train_images", type=int, default=300)
+    p.add_argument("--max_val_images", type=int, default=150)
 
     # Eval knobs
+    p.add_argument("--eval_every", type=int, default=1)
     p.add_argument("--eval_score_thresh", type=float, default=0.05)
     p.add_argument("--eval_max_dets", type=int, default=100)
 
     p.add_argument("--output_dir", type=str, default="models")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--print_dist", action="store_true", help="Print label distribution for sanity check")
 
     args = p.parse_args()
     main(args)

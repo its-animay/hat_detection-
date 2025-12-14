@@ -9,15 +9,8 @@ def _replace_head(model, num_classes: int):
 
 
 def get_model(num_classes: int, backbone: str = "resnet50"):
-    """
-    Create a Faster R-CNN model with a configurable backbone.
-
-    backbone:
-      - \"resnet50\" (default): strongest but heavier
-      - \"mobilenet\": lighter/faster, good for low compute
-      - \"mobilenet_320\": lightest (320px), fastest, lower accuracy
-    """
     backbone = backbone.lower()
+
     if backbone == "mobilenet":
         model = torchvision.models.detection.fasterrcnn_mobilenet_v3_large_fpn(weights="DEFAULT")
     elif backbone == "mobilenet_320":

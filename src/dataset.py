@@ -23,9 +23,7 @@ class ToTensor:
 
 
 class ColorJitter:
-    """Light photometric augmentation; does not touch boxes."""
-
-    def __init__(self, brightness=0.15, contrast=0.15, saturation=0.1, hue=0.05):
+    def __init__(self, brightness=0.25, contrast=0.25, saturation=0.2, hue=0.08):
         self.t = torchvision.transforms.ColorJitter(
             brightness=brightness, contrast=contrast, saturation=saturation, hue=hue
         )
@@ -49,6 +47,7 @@ class RandomHorizontalFlip:
                 target["boxes"] = boxes
         return image, target
 
+
 class Resize:
     def __init__(self, min_size=None, max_size=None):
         self.min_size = min_size
@@ -60,28 +59,26 @@ class Resize:
 
         orig_w, orig_h = image.size
         scale = self.min_size / min(orig_h, orig_w)
-        if self.max_size is not None:
-            if max(orig_h, orig_w) * scale > self.max_size:
-                scale = self.max_size / max(orig_h, orig_w)
+        if self.max_size is not None and max(orig_h, orig_w) * scale > self.max_size:
+            scale = self.max_size / max(orig_h, orig_w)
 
         new_w, new_h = int(round(orig_w * scale)), int(round(orig_h * scale))
         if new_w == orig_w and new_h == orig_h:
             return image, target
 
         image = torchvision.transforms.functional.resize(image, [new_h, new_w])
+
         boxes = target["boxes"]
         if boxes.numel() > 0:
-            scale_tensor = torch.tensor([scale, scale, scale, scale], dtype=boxes.dtype)
-            boxes = boxes * scale_tensor
+            boxes = boxes * torch.tensor([scale, scale, scale, scale], dtype=boxes.dtype)
             target["boxes"] = boxes
             target["area"] = target["area"] * (scale * scale)
+
         return image, target
 
 
 class RandomResize:
-    """Jitter the short side before resizing; keeps aspect ratio, clamps long side."""
-
-    def __init__(self, base_min, max_size=None, scale_range=(0.8, 1.2)):
+    def __init__(self, base_min, max_size=None, scale_range=(0.6, 1.4)):
         self.base_min = base_min
         self.max_size = max_size
         self.scale_range = scale_range
@@ -89,12 +86,10 @@ class RandomResize:
     def __call__(self, image, target):
         if self.base_min is None:
             return image, target
-        if self.scale_range is not None:
-            scale_factor = random.uniform(self.scale_range[0], self.scale_range[1])
-        else:
-            scale_factor = 1.0
-        jittered_min = int(max(1, round(self.base_min * scale_factor)))
+        s = random.uniform(self.scale_range[0], self.scale_range[1])
+        jittered_min = int(max(1, round(self.base_min * s)))
         return Resize(jittered_min, self.max_size)(image, target)
+
 
 class HelmetDataset(torch.utils.data.Dataset):
     def __init__(self, root, annotation_file, transforms=None):
@@ -102,78 +97,60 @@ class HelmetDataset(torch.utils.data.Dataset):
         self.transforms = transforms
         self.coco = COCO(annotation_file)
         self.ids = list(sorted(self.coco.imgs.keys()))
-        # Map original category ids to contiguous labels starting from 1 (0 is background)
+
+        # Map COCO category IDs -> contiguous labels 1..K (0 is background)
         cat_ids = sorted(self.coco.cats.keys())
         self.cat_id_to_label = {cat_id: idx + 1 for idx, cat_id in enumerate(cat_ids)}
         self.label_to_cat_id = {v: k for k, v in self.cat_id_to_label.items()}
 
     def __getitem__(self, index):
-        # Own coco file
         coco = self.coco
-        # Image ID
         img_id = self.ids[index]
-        # List: get annotation id from coco
+
         ann_ids = coco.getAnnIds(imgIds=img_id)
-        # Dictionary: target coco_annotation file for an image
-        coco_annotation = coco.loadAnns(ann_ids)
-        # Path for input image
-        path = coco.loadImgs(img_id)[0]['file_name']
-        # Open image
-        img = Image.open(os.path.join(self.root, path)).convert('RGB')
+        coco_anns = coco.loadAnns(ann_ids)
+
+        info = coco.loadImgs(img_id)[0]
+        path = info["file_name"]
+        img = Image.open(os.path.join(self.root, path)).convert("RGB")
         img_w, img_h = img.size
 
-        # Number of objects in the image
-        num_objs = len(coco_annotation)
+        boxes, labels, areas, iscrowd = [], [], [], []
 
-        # Bounding boxes for objects
-        # In coco format, bbox = [xmin, ymin, width, height]
-        # In pytorch, the input should be [xmin, ymin, xmax, ymax]
-        boxes = []
-        labels = []
-        areas = []
-        iscrowd = []
+        for ann in coco_anns:
+            x, y, w, h = ann["bbox"]
+            x0 = max(0.0, float(x))
+            y0 = max(0.0, float(y))
+            x1 = min(float(img_w), float(x) + float(w))
+            y1 = min(float(img_h), float(y) + float(h))
 
-        for i in range(num_objs):
-            xmin = coco_annotation[i]['bbox'][0]
-            ymin = coco_annotation[i]['bbox'][1]
-            w = coco_annotation[i]['bbox'][2]
-            h = coco_annotation[i]['bbox'][3]
-
-            # Convert to [xmin, ymin, xmax, ymax] and clamp to image bounds
-            x0 = max(0, xmin)
-            y0 = max(0, ymin)
-            x1 = min(img_w, xmin + w)
-            y1 = min(img_h, ymin + h)
-
-            # Skip invalid/zero-area boxes to avoid exploding losses
             if x1 <= x0 or y1 <= y0:
                 continue
 
             boxes.append([x0, y0, x1, y1])
-            labels.append(self.cat_id_to_label[coco_annotation[i]['category_id']])
+            labels.append(self.cat_id_to_label[int(ann["category_id"])])
             areas.append((x1 - x0) * (y1 - y0))
-            iscrowd.append(coco_annotation[i]['iscrowd'])
+            iscrowd.append(int(ann.get("iscrowd", 0)))
 
-        if num_objs > 0:
-            boxes = torch.as_tensor(boxes, dtype=torch.float32)
-            labels = torch.as_tensor(labels, dtype=torch.int64)
-            areas = torch.as_tensor(areas, dtype=torch.float32)
-            iscrowd = torch.as_tensor(iscrowd, dtype=torch.int64)
+        # ✅ CRITICAL FIX: use len(boxes), not len(coco_anns)
+        if len(boxes) > 0:
+            boxes = torch.tensor(boxes, dtype=torch.float32)
+            labels = torch.tensor(labels, dtype=torch.int64)
+            areas = torch.tensor(areas, dtype=torch.float32)
+            iscrowd = torch.tensor(iscrowd, dtype=torch.int64)
         else:
-            # Handle images with no objects
             boxes = torch.zeros((0, 4), dtype=torch.float32)
             labels = torch.zeros((0,), dtype=torch.int64)
             areas = torch.zeros((0,), dtype=torch.float32)
             iscrowd = torch.zeros((0,), dtype=torch.int64)
 
-        img_id = torch.tensor([img_id])
-        
-        target = {}
-        target["boxes"] = boxes
-        target["labels"] = labels
-        target["image_id"] = img_id
-        target["area"] = areas
-        target["iscrowd"] = iscrowd
+        target = {
+            "boxes": boxes,
+            "labels": labels,
+            "image_id": torch.tensor([img_id]),
+            "area": areas,
+            "iscrowd": iscrowd,
+        }
 
         if self.transforms is not None:
             img, target = self.transforms(img, target)
@@ -183,15 +160,15 @@ class HelmetDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.ids)
 
-def get_transform(train, resize_min=None, resize_max=None, resize_jitter=0.2):
-    transforms = []
-    # Resize (with optional jitter) first so boxes stay aligned
-    if train and resize_jitter and resize_min:
-        transforms.append(RandomResize(resize_min, resize_max, scale_range=(1 - resize_jitter, 1 + resize_jitter)))
-    else:
-        transforms.append(Resize(resize_min, resize_max))
+
+def get_transform(train: bool, resize_min=800, resize_max=1333):
+    t = []
     if train:
-        transforms.append(RandomHorizontalFlip(0.5))
-        transforms.append(ColorJitter())
-    transforms.append(ToTensor())
-    return Compose(transforms)
+        t.append(RandomResize(resize_min, resize_max, scale_range=(0.6, 1.4)))
+        t.append(RandomHorizontalFlip(0.5))
+        t.append(ColorJitter())
+    else:
+        t.append(Resize(resize_min, resize_max))
+
+    t.append(ToTensor())
+    return Compose(t)

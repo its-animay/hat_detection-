@@ -22,6 +22,18 @@ class ToTensor:
         return torchvision.transforms.functional.to_tensor(image), target
 
 
+class ColorJitter:
+    """Light photometric augmentation; does not touch boxes."""
+
+    def __init__(self, brightness=0.15, contrast=0.15, saturation=0.1, hue=0.05):
+        self.t = torchvision.transforms.ColorJitter(
+            brightness=brightness, contrast=contrast, saturation=saturation, hue=hue
+        )
+
+    def __call__(self, image, target):
+        return self.t(image), target
+
+
 class RandomHorizontalFlip:
     def __init__(self, prob=0.5):
         self.prob = prob
@@ -64,6 +76,25 @@ class Resize:
             target["boxes"] = boxes
             target["area"] = target["area"] * (scale * scale)
         return image, target
+
+
+class RandomResize:
+    """Jitter the short side before resizing; keeps aspect ratio, clamps long side."""
+
+    def __init__(self, base_min, max_size=None, scale_range=(0.8, 1.2)):
+        self.base_min = base_min
+        self.max_size = max_size
+        self.scale_range = scale_range
+
+    def __call__(self, image, target):
+        if self.base_min is None:
+            return image, target
+        if self.scale_range is not None:
+            scale_factor = random.uniform(self.scale_range[0], self.scale_range[1])
+        else:
+            scale_factor = 1.0
+        jittered_min = int(max(1, round(self.base_min * scale_factor)))
+        return Resize(jittered_min, self.max_size)(image, target)
 
 class HelmetDataset(torch.utils.data.Dataset):
     def __init__(self, root, annotation_file, transforms=None):
@@ -152,12 +183,15 @@ class HelmetDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.ids)
 
-def get_transform(train, resize_min=None, resize_max=None):
+def get_transform(train, resize_min=None, resize_max=None, resize_jitter=0.2):
     transforms = []
-    # Resize first so boxes stay aligned
-    transforms.append(Resize(resize_min, resize_max))
+    # Resize (with optional jitter) first so boxes stay aligned
+    if train and resize_jitter and resize_min:
+        transforms.append(RandomResize(resize_min, resize_max, scale_range=(1 - resize_jitter, 1 + resize_jitter)))
+    else:
+        transforms.append(Resize(resize_min, resize_max))
     if train:
-        # Simple horizontal flip that also updates boxes
         transforms.append(RandomHorizontalFlip(0.5))
+        transforms.append(ColorJitter())
     transforms.append(ToTensor())
     return Compose(transforms)

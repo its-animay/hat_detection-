@@ -305,13 +305,13 @@ def main(args):
     train_full = HelmetDataset(
         str(train_dir),
         str(train_ann),
-        get_transform(train=True, resize_min=args.resize, resize_max=args.resize_max),
+        get_transform(train=True, resize_min=args.resize, resize_max=args.resize_max, resize_jitter=args.resize_jitter),
     )
 
     val_full = HelmetDataset(
         str(val_dir),
         str(val_ann),
-        get_transform(train=False, resize_min=args.resize, resize_max=args.resize_max),
+        get_transform(train=False, resize_min=args.resize, resize_max=args.resize_max, resize_jitter=0.0),
     )
 
     # Subset 
@@ -431,7 +431,7 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser("Helmet Detection")
 
     p.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
-    p.add_argument("--model", default="mobilenet_320", choices=["resnet50", "mobilenet", "mobilenet_320"])
+    p.add_argument("--model", default="resnet50", choices=["resnet50", "mobilenet", "mobilenet_320"])
 
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--batch_size", type=int, default=2)
@@ -445,8 +445,9 @@ if __name__ == "__main__":
     p.add_argument("--grad_clip_norm", type=float, default=1.0)
     p.add_argument("--amp", action="store_true")
 
-    p.add_argument("--resize", type=int, default=640)
-    p.add_argument("--resize_max", type=int, default=640)
+    p.add_argument("--resize", type=int, default=800)
+    p.add_argument("--resize_max", type=int, default=1024)
+    p.add_argument("--resize_jitter", type=float, default=0.2, help="Scale jitter for training resize (e.g., 0.2 -> 80%-120%)")
 
     p.add_argument("--num_workers", type=int, default=2)
 

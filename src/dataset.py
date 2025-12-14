@@ -161,10 +161,10 @@ class HelmetDataset(torch.utils.data.Dataset):
         return len(self.ids)
 
 
-def get_transform(train: bool, resize_min=800, resize_max=1333):
+def get_transform(train: bool, resize_min=800, resize_max=1333, resize_jitter=None):
     t = []
     if train:
-        t.append(RandomResize(resize_min, resize_max, scale_range=(0.6, 1.4)))
+        t.append(RandomResize(resize_min, resize_max, scale_range=(0.6, 1.4) if resize_jitter is None else (1 - resize_jitter, 1 + resize_jitter)))
         t.append(RandomHorizontalFlip(0.5))
         t.append(ColorJitter())
     else:

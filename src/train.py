@@ -271,7 +271,7 @@ def evaluate_torchmetrics(model, data_loader, device, score_thresh=0.05, max_det
         metric.update(preds, gts)
 
     res = metric.compute()
-    return float(res["map_50"].item()), res
+    return float(res.get("map_50", torch.tensor(0.0)).item()), res
 
 
 # -----------------------------
@@ -386,11 +386,22 @@ def main(args):
                     score_thresh=args.eval_score_thresh,
                     max_dets=args.eval_max_dets,
                 )
+                mar = None
+                if "mar_100" in full:
+                    mar = float(full["mar_100"].item())
+                elif "mar" in full:
+                    mar = float(full["mar"].item())
+
+                precision = None
+                map_per_class = full.get("map_per_class", None)
+                if map_per_class is not None and hasattr(map_per_class, "numel") and map_per_class.numel() > 0:
+                    precision = float(map_per_class.mean().item())
+
                 metrics_to_print = {
                     "mAP@0.5": mAP50,
-                    "mAP@0.5:0.95": float(full["map"].item()),
-                    "precision": float(full["map_per_class"].mean().item()) if full["map_per_class"].numel() > 0 else None,
-                    "recall": float(full["mar"].item()),
+                    "mAP@0.5:0.95": float(full.get("map", torch.tensor(0.0)).item()),
+                    "precision": precision,
+                    "recall": mar,
                 }
                 val_score = mAP50
 

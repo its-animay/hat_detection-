@@ -107,10 +107,15 @@ def train_one_epoch(model, optimizer, data_loader, device, epoch, use_amp, grad_
 
 @torch.no_grad()
 def evaluate_coco(model, data_loader, device, score_thresh=0.05, max_dets=100):
+    """COCO eval fallback; if COCO json lacks 'info', add a stub."""
     model.eval()
 
     base = get_base_dataset(data_loader.dataset)
     coco = getattr(base, "coco", None)
+    if coco is None:
+        raise ValueError("COCO annotations not found.")
+    # Ensure coco.dataset has 'info' to avoid loadRes errors
+    coco.dataset.setdefault("info", {"description": "converted"})
     label_to_cat = getattr(base, "label_to_cat_id", None)
 
     results = []
@@ -123,7 +128,7 @@ def evaluate_coco(model, data_loader, device, score_thresh=0.05, max_dets=100):
         for i, out in enumerate(outputs):
             image_id = int(targets[i]["image_id"].item())
 
-            # COCO expects ORIGINAL coords
+            # COORDS: scale back to original
             info = coco.loadImgs(image_id)[0]
             orig_w, orig_h = float(info["width"]), float(info["height"])
 
@@ -167,7 +172,8 @@ def evaluate_coco(model, data_loader, device, score_thresh=0.05, max_dets=100):
     coco_eval.evaluate()
     coco_eval.accumulate()
     coco_eval.summarize()
-    return float(coco_eval.stats[1])  # stats[1] is often AP@0.5 (depending on COCOeval version)
+    # stats[1] is AP@0.5 in pycocotools (0-based index)
+    return float(coco_eval.stats[1])
 
 
 def main(args):

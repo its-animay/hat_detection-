@@ -16,9 +16,18 @@ from torchmetrics.detection.mean_ap import MeanAveragePrecision
 if __package__ is None or __package__ == "":
     project_root = Path(__file__).resolve().parent.parent
     sys.path.append(str(project_root))
+else:
+    project_root = Path(__file__).resolve().parent.parent
 
-from src.dataset import HelmetDataset, get_transform
-from src.model import get_model
+try:
+    from src.dataset import HelmetDataset, get_transform
+    from src.model import get_model
+except ModuleNotFoundError:
+    # Fallback: ensure project root is on sys.path
+    if str(project_root) not in sys.path:
+        sys.path.append(str(project_root))
+    from src.dataset import HelmetDataset, get_transform
+    from src.model import get_model
 
 
 # -----------------------------
